@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Outputs
+artifacts/
+*.mp4
+*.gif
+*.png
+
+# Editors
+.vscode/
+.idea/
