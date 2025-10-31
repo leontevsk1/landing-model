@@ -7,70 +7,106 @@ class Beacon:
         self.pos = np.array([0.0, 0.0, 0.0])
         self.p = 0.0
         self.n = 8
-        self.a = 60
+        self.ang = 60
         self.t = 0.8 / 1000
         self.base = 0.0
         
         self._step = 360.0 / self.n
-        self._half = self.a / 2.0
+        self._half = self.ang / 2.0
 
     def directional_gain(self, delta_deg):
         x = np.abs(np.asarray(delta_deg, dtype=float))
         return np.where(x >= self._half, 0.0, 1.0 - x / self._half)
-    
-    def enable_sector_by_id(self, i):
-        i = int(i) % self.n
-        c = i * self._step
-        a = (c - self._half) % 360.0
-        b = (c + self._half) % 360.0
-        info = {"sector_id": i, "center_deg": c, "bounds_deg": (a, b)}
 
-        # "включение" на время t
-        print(f"[ON] sector {i} → {a:.1f}°–{b:.1f}°  (duration {self.t*1000:.1f} ms)")
-        time.sleep(self.t)
-        print(f"[OFF] sector {i}")
-        return info
-    
-    def rotation(self):
-        i = 0
-        while True:
-            self.enable_sector_by_id(i)
-            time.sleep(self.t)
-            i = (i + 1) % self.n
-            
-    def signal_power_at(self, t, point_xyz):
-        s = self.active_sector(t)
+    def signal_power_at(self, sector_id, point_xyz):
+        s = int(sector_id) % self.n
+        dx, dy, dz = np.array(point_xyz, dtype=float) - self.pos
+        r = float(np.sqrt(dx*dx + dy*dy + dz*dz)) + 1e-12
 
-        # Вектор от маяка к точке (мы как симуляция — знаем)
-        dx, dy, dz = np.array(point_xyz) - self.pos
-        r = np.sqrt(dx*dx + dy*dy + dz*dz) + 1e-9  # чтобы не делить на ноль
+        ang  = np.degrees(np.arctan2(dy, dx))
+        phi  = (self.base + s * self._step)
+        diff = ((ang - phi + 180.0) % 360.0) - 180.0
 
-        # Направление точки относительно оси антенны
-        ang = np.degrees(np.arctan2(dy, dx))
-        phi = s * self.beam_deg
-        diff = (ang - phi + 180) % 360 - 180
+        g_lin = float(self.directional_gain(diff))    # 0..1
+        if g_lin == 0.0:
+            return s, 0.0
 
-        # Коэффициент усиления (0..1)
-        gain = self.directional_gain(diff)
+        Ptx_lin = 10.0**(self.p/10.0)
+        rx_lin  = Ptx_lin * g_lin / (r*r)
+        return s, rx_lin
 
-        # Простейшая модель затухания
-        #   RSSI = P_tx - 20*log10(r) + G(θ)
-        rssi = self.p - 20*np.log10(r) + gain*10
-        return s, rssi
 
 if __name__ == "__main__":
     b = Beacon()
 
-    print("enable_sector_by_id:")
-    for i in range(8):
-        print(i, "→", b.enable_sector_by_id(i))
+    # Точки-дроны для демонстрации
+    points = {
+        "A": np.array([20.0, 7.0, 0.0]),
+        "B": np.array([-20.0, 0.0, 0.0]),
+    }
+    i=0
+    while True: 
+        time.sleep(1) 
+        print(f"Мощность сигнала в точке {points['A']}", b.signal_power_at(i, points['A'])) 
+        print(f"Мощность сигнала в точке {points['B']}", b.signal_power_at(i, points['B'])) 
+        i+=1 
+        if i == 8: 
+            break
 
-    
-    # Пример gain: отклонения от центра сектора
-    deltas = np.array([-40, -30, -15, 0, 15, 30, 40], dtype=float)
-    print("\ndirectional_gain on deltas:", deltas, "→", b.directional_gain(deltas))
-    
-    print("\nrotation(θ):")
-    
-    print(b.rotation())
-    
+
+    fig = plt.figure(figsize=(7,7))
+    ax = fig.add_subplot(111, polar=True)
+    ax.set_theta_zero_location('E')      # 0° = +X (вправо)
+    ax.set_theta_direction(-1)           # CCW = +
+    ax.set_thetagrids(np.arange(0,360,45))
+    r_max = 40.0
+    ax.set_rmax(r_max)
+
+    theta = np.linspace(-np.pi, np.pi, 720)
+
+    i = 0
+    while True:
+        ax.clear()
+        ax.set_theta_zero_location('E')
+        ax.set_theta_direction(-1)
+        ax.set_thetagrids(np.arange(0,360,45))
+        ax.set_rmax(r_max)
+        ax.set_title(f"Активный сектор {i}", va='bottom')
+
+        # текущий сектор — центр и границы
+        phi_deg  = (b.base + i*b._step)
+        phi      = np.deg2rad(phi_deg)
+        half     = np.deg2rad(b._half)
+
+        # рисуем треугольный лепесток
+        d_angles = (np.degrees(theta) - phi_deg + 180.0) % 360.0 - 180.0
+        gains    = b.directional_gain(d_angles)
+        ax.plot(theta, gains*r_max, linewidth=2)
+        ax.fill_between(theta, 0, gains*r_max, alpha=0.3)
+
+        # границы сектора
+        ax.plot([phi-half, phi-half], [0, r_max], ls='--', lw=0.8)
+        ax.plot([phi+half, phi+half], [0, r_max], ls='--', lw=0.8)
+
+        # --- точки ---
+        for name, pt in points.items():
+            dx, dy = pt[0]-b.pos[0], pt[1]-b.pos[1]
+            r = float(np.hypot(dx, dy))
+            ang_rad = np.arctan2(dy, dx)   # [-π, π]
+            ang_deg = np.degrees(ang_rad)
+            # отклонение от центра активного сектора
+            delta = ((ang_deg - phi_deg + 180.0) % 360.0) - 180.0
+            gain_lin = float(b.directional_gain(delta))
+
+            # цвет точки: внутри лепестка — зелёный, вне — серый
+            color = 'tab:green' if gain_lin > 0.0 else 'tab:gray'
+
+            # текущая мощность (линейная модель, как в методе)
+            _, rx = b.signal_power_at(i, pt)
+
+            ax.scatter([ang_rad], [min(r, r_max)], s=50, marker='o', color=color)
+            ax.text(ang_rad, min(r, r_max)*1.02,
+                    f"{name}\nrx={rx:.3g}", ha='center', va='bottom')
+
+        plt.pause(0.6)
+        i = (i + 1) % b.n
