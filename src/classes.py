@@ -63,7 +63,7 @@ class Drone:
         self.pos = np.array([x, y, z], float)
         self.landing_power = 10.0
         self.safe_power = 1.0
-        salf.landing_flag = False
+        self.landing_flag = False
     def measure_flux(self, env: Environment) -> float:
         return env.power_lin_at(self.pos)
     
