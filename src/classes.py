@@ -16,6 +16,23 @@ TDM_SWITCH_RATE = 1.0             # период переключения сек
 # Контроль/безопасность
 R_MIN = 0.5                       # минимально учитываемая дистанция до маяка (м)
 
+# ----------------------------- ПАРАМЕТРЫ ПОСАДКИ (эвристики) -------------------------
+# Скорости (м/с)
+LANDING_SPEED_MPS = 20.0 / 3.6      # 20 км/ч -> 5.55 м/с
+LANDING_FINAL_SPEED_MPS = 2.0 / 3.6 # 2 км/ч -> 0.55 м/с
+
+# Высоты (м)
+LANDING_FINAL_ALTITUDE = 4.0        # 4 м
+
+# Пороги мощности (Вт/м^2) - ЭТИ ЗНАЧЕНИЯ НУЖНО ПОДБИРАТЬ!
+LANDING_DECEL_POWER = 5.0           # Порог для замедления до 20 км/ч
+LANDING_SAFE_POWER = 1.0           # Порог "безопасной зоны" для остановки
+
+# Параметры контроллера (M0)
+POWER_TOLERANCE = 0.01              # Допуск для P(S0) == P(S1)
+STRAFE_DISTANCE_M = 0.5             # (м) Величина "шага" вбок для коррекции
+DESCENT_ANGLE_RAD = math.radians(5.0) # Угол снижения (5 градусов)
+
 # ----------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------------
 def axis_unit(yaw_idx: int, axis_pitch_rad: float) -> np.ndarray:
     """
@@ -46,7 +63,7 @@ class Beacon:
         self._tdm_timer = 0.0
 
     def update(self, dt: float):
-        """Переключение активного сектора по таймеру TDM."""
+        """Переключение активного сектора по таймеру."""
         self._tdm_timer += dt
         if self._tdm_timer >= TDM_SWITCH_RATE:
             steps = int(self._tdm_timer // TDM_SWITCH_RATE)
@@ -125,137 +142,95 @@ class Drone:
         """
         self.pos += self.direction * self.speed * dt
         
-        # --- ИСПРАВЛЕНИЕ КИНЕМАТИКИ: ОСТАНОВКА НА ЗЕМЛЕ ---
+        # ОСТАНОВКА НА ЗЕМЛЕ
         if self.pos[2] < 0.0:
-            self.pos[2] = 0.0      # Клип Z
+            self.pos[2] = 0.0
             self.speed = 0.0       # Остановка
-            # Выравниваем направление по горизонту, чтобы не "тыкать носом" в землю
+
             self.direction[2] = 0.0
             if np.linalg.norm(self.direction[:2]) > self._eps_xy:
                  self.direction /= np.linalg.norm(self.direction)
             else:
                  self.direction = np.array([1.0, 0.0, 0.0]) # Деградация до +X
-        # --------------------------------------------------
-
-# -------------------------------- КОНТРОЛЛЕР ---------------------------------
+    def point_toward_beacon(self, env: Environment):
+        """
+        Устанавливает направление дрона прямо на маяк.
+        Вычисляет единичный вектор от дрона к маяку и устанавливает его как направление движения.
+        """
+        beacon_pos = env.beacon.pos
+        direction_to_beacon = beacon_pos - self.pos
+        
+        # Проверка на нулевое расстояние
+        distance = np.linalg.norm(direction_to_beacon)
+        if distance < self._eps_xy:
+            # Если дрон уже у маяка - сохраняем текущее направление
+            return
+        
+        # Нормализуем вектор направления
+        self.direction = direction_to_beacon / distance
+        
 class Controller:
-    def __init__(self, drone: Drone, env: Environment):
-        self.drone = drone
-        self.env = env
+    def __init__(self):
+        self.state_timer = 0.0
+        self.power_readings = {}
+        self.last_total_power = 0.0
 
-        # ---- КУРСОВОЙ (УЛУЧШЕННЫЕ КОНСТАНТЫ) ----
-        self.LOCALIZER_P_GAIN = math.radians(8.0)
-        self.FLUX_MIN_THRESHOLD = 1e-5
-        self.INITIAL_SHIFT_YAW = math.radians(12.0)
-        self.P_DIFF_EPS = 1e-6
-        self.MAX_CORRECTION_ANGLE = math.radians(6.0)
+    def update(self, env: Environment, drone: Drone, dt: float):
+        self.state_timer += dt
+        p, s_id = drone.measure_flux(env)
+        self.power_readings[s_id] = p
+        self.last_total_power = p
 
-        # ---- ПОИСК (НОВАЯ ЛОГИКА) ----
-        self.SEEK_ENABLED = True
-        self.SEEK_YAW_RATE = math.radians(2.0)
-        self.SIGNAL_LOST_TIMEOUT = 2.5
-        self._time_since_seen = 1e9
+        if self.state_timer < TDM_SWITCH_RATE + dt:
+            return
 
-        # ---- ГЛИССАДА/СКОРОСТЬ ----
-        self.PITCH_TARGET_RAD = math.radians(-5.0)
-        self.GLIDE_PITCH_GAIN = 0.12
-        self.SPEED_TARGET = 1.0 # Целевая скорость
-        self.POWER_FALL_BOOST_DEG = 0.5
-        self.POWER_FALL_RATIO = 0.95
-        self.FLARE_ALT = 4.0
-        self.FLARE_PITCH_TARGET = math.radians(-1.0)
-        self.FLARE_BLEND = 0.6
+        drone.point_toward_beacon(env)
 
-        # ---- ПАМЯТЬ ----
-        self.is_landing_activated = False
-        self.last_power_flux = 0.0
-        self.last_sector_id = -1
+        if self.last_total_power > LANDING_DECEL_POWER:
+            if drone.speed > LANDING_SPEED_MPS:
+                drone.speed = LANDING_SPEED_MPS
+            current_dir_xy = drone.direction[:2]
+            xy_norm = np.linalg.norm(current_dir_xy)
+            if xy_norm > 1e-6:
+                current_dir_xy /= xy_norm
+            z_comp = math.sin(-DESCENT_ANGLE_RAD)
+            xy_comp = math.cos(-DESCENT_ANGLE_RAD)
+            drone.direction[:2] = current_dir_xy * xy_comp
+            drone.direction[2] = z_comp
+            drone.direction /= np.linalg.norm(drone.direction)
 
-    def _current_pitch(self) -> float:
-        d = self.drone.direction
-        d_norm = np.linalg.norm(d)
-        return math.asin(np.clip(d[2] / d_norm, -1.0, 1.0)) if d_norm > 1e-6 else 0.0
-
-    def _compute_yaw_delta(self, power_flux: float, sector_id: int, dt: float) -> float:
-        dyaw = 0.0
-        seen_now = power_flux > self.FLUX_MIN_THRESHOLD
-        
-        # 1) Вход в перекрытие
-        if self.last_power_flux <= self.FLUX_MIN_THRESHOLD and seen_now:
-            # Смещаемся CCW (+yaw) для гарантированного попадания в зону overlap
-            return +self.INITIAL_SHIFT_YAW
-
-        # 2) Сравнение двух последовательных измерений
-        if seen_now and self.last_power_flux > self.FLUX_MIN_THRESHOLD:
-            denom = max(power_flux, self.last_power_flux, self.P_DIFF_EPS)
-            diff_norm = (self.last_power_flux - power_flux) / denom
-            dyaw = diff_norm * self.LOCALIZER_P_GAIN
-            dyaw = float(np.clip(dyaw, -self.MAX_CORRECTION_ANGLE, self.MAX_CORRECTION_ANGLE))
-            return dyaw
-
-        # 3) Режим поиска (работает только после активации посадки)
-        if self.SEEK_ENABLED and self.is_landing_activated: 
-            # Начинаем крутиться, чтобы найти сигнал
-            if self._time_since_seen < self.SIGNAL_LOST_TIMEOUT:
-                dyaw += self.SEEK_YAW_RATE * dt   # CCW
-            else:
-                dyaw += 2.0 * self.SEEK_YAW_RATE * dt # Ускоренный поиск
-
-        return dyaw
-
-    def _compute_vertical_delta(self, power_flux: float) -> float:
-        pitch_now = self._current_pitch()
-        pitch_target = self.PITCH_TARGET_RAD
-        
-        # Flare у земли
-        if self.drone.pos[2] <= self.FLARE_ALT:
-            pitch_target = (1.0 - self.FLARE_BLEND) * pitch_target + self.FLARE_BLEND * self.FLARE_PITCH_TARGET
+        if drone.pos[2] <= LANDING_FINAL_ALTITUDE and self.last_total_power > LANDING_SAFE_POWER:
+            drone.speed = LANDING_FINAL_SPEED_MPS
+            drone.direction = np.array([0.0, 0.0, -1.0])
             
-        error = pitch_target - pitch_now
-        delta_pitch = error * self.GLIDE_PITCH_GAIN
-        
-        # Эвристика: просел поток - увеличиваем снижение
-        if power_flux < self.last_power_flux * self.POWER_FALL_RATIO and self.last_power_flux > self.FLUX_MIN_THRESHOLD:
-            delta_pitch -= math.radians(self.POWER_FALL_BOOST_DEG)
-            
-        return delta_pitch
+        if self.last_total_power > LANDING_SAFE_POWER:
+            drone.speed = 0.0
 
-    def _compute_speed_delta(self, power_flux: float) -> float:
-        delta_v = 0.0
-        if self.drone.speed > self.SPEED_TARGET:
-            delta_v += -(self.drone.speed - self.SPEED_TARGET) * 0.12
-        if power_flux > 0.5:
-            delta_v += -0.05 * power_flux
-        return delta_v
+        if drone.speed == 0.0:
+            self.power_readings = {}
+            self.state_timer = 0.0
+            return
 
-    def run_control_cycle(self, dt: float):
-        self.env.update(dt)
-        power_flux, sector_id = self.drone.measure_flux(self.env)
+        visible_sectors = list(self.power_readings.keys())
+        forward_vec = drone.direction.copy()
+        up_vec = np.array([0.0, 0.0, 1.0])
+        right_vec = np.cross(forward_vec, up_vec)
+        right_vec /= np.linalg.norm(right_vec)
 
-        # Обновляем таймер «как давно видели сигнал»
-        if power_flux > self.FLUX_MIN_THRESHOLD:
-            self._time_since_seen = 0.0
+        if len(visible_sectors) < 2:
+            drone.pos += right_vec * STRAFE_DISTANCE_M
         else:
-            self._time_since_seen += dt
+            s0, s1 = visible_sectors[0], visible_sectors[1]
+            p0 = self.power_readings[s0]
+            p1 = self.power_readings[s1]
+            if abs(p0 - p1) < POWER_TOLERANCE:
+                pass
+            elif p0 > p1:
+                drone.pos += right_vec * STRAFE_DISTANCE_M
+            else:
+                drone.pos -= right_vec * STRAFE_DISTANCE_M
 
-        # Активация посадки
-        if not self.is_landing_activated and power_flux > self.FLUX_MIN_THRESHOLD:
-            self.is_landing_activated = True
-            print(f"--- АКТИВАЦИЯ ПОСАДКИ (Поток: {power_flux:.4f}) ---")
-
-        # Управление применяется только после активации
-        if self.is_landing_activated:
-            dyaw   = self._compute_yaw_delta(power_flux, sector_id, dt)
-            dpitch = self._compute_vertical_delta(power_flux)
-            dspeed = self._compute_speed_delta(power_flux)
-
-            self.drone.change_yaw(dyaw)
-            self.drone.change_altitude_rate(dpitch)
-            self.drone.change_speed(dspeed)
+        self.power_readings = {}
+        self.state_timer = 0.0
         
-        # Если посадка не активирована, но надо искать сигнал (допустим, медленный полет по прямой)
-        # Добавлять сюда сложнее. Пока оставляем: дрон летит по прямой, пока не увидит сигнал.
 
-        self.drone.integrate(dt)
-        self.last_power_flux = power_flux
-        self.last_sector_id = sector_id
