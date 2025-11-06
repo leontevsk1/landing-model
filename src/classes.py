@@ -12,7 +12,7 @@ POWER = 15.0                      # мощность излучения маяк
 # Симуляция/время
 SIM_DT = 0.1                      # шаг симуляции (с)
 TDM_SWITCH_RATE = 1.0             # период переключения сектора (с)
-
+TDM_OFF_FRACTION = 0.15
 # Контроль/безопасность
 R_MIN = 0.5                       # минимально учитываемая дистанция до маяка (м)
 
@@ -33,6 +33,11 @@ POWER_TOLERANCE = 0.01              # Допуск для P(S0) == P(S1)
 STRAFE_DISTANCE_M = 0.5             # (м) Величина "шага" вбок для коррекции
 DESCENT_ANGLE_RAD = math.radians(5.0) # Угол снижения (5 градусов)
 
+# classes.py (вверху рядом с константами)
+K_YAW = math.radians(2.0)    # P-коэф. для поворота (рад на единицу норм. ошибки)
+MAX_YAW_STEP = math.radians(5.0)
+
+
 # ----------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------------
 def axis_unit(yaw_idx: int, axis_pitch_rad: float) -> np.ndarray:
     """
@@ -41,6 +46,10 @@ def axis_unit(yaw_idx: int, axis_pitch_rad: float) -> np.ndarray:
     yaw = (yaw_idx % N) * STEP
     cp, sp = math.cos(axis_pitch_rad), math.sin(axis_pitch_rad)
     return np.array([cp * math.cos(yaw), cp * math.sin(yaw), sp], dtype=float)
+
+def mod_adjacent(a, b, n):
+    """True если b == a±1 по модулю n."""
+    return (b - a) % n in (1, n-1)
 
 def energy_flux(R: float, alpha: float, w: float, P: float) -> float:
     """
@@ -174,63 +183,73 @@ class Controller:
         self.state_timer = 0.0
         self.power_readings = {}
         self.last_total_power = 0.0
+        self._last_sector = None
+        self._pair = None  # (s0,p0,s1,p1) последняя валидная смежная пара
+
+    def _try_make_adjacent_pair(self, sid, p):
+        # формируем пару только если текущий сектор смежен с предыдущим
+        if self._last_sector is None:
+            self._last_sector = (sid, p)
+            return
+        s_prev, p_prev = self._last_sector
+        if mod_adjacent(s_prev, sid, N):
+            self._pair = (s_prev, p_prev, sid, p)
+            self._last_sector = (sid, p)  # разрешим перекрытие пар
+        else:
+            # сброс — держим только последовательных соседей
+            self._last_sector = (sid, p)
+            self._pair = None
 
     def update(self, env: Environment, drone: Drone, dt: float):
         self.state_timer += dt
+
         p, s_id = drone.measure_flux(env)
         self.power_readings[s_id] = p
         self.last_total_power = p
+        self._try_make_adjacent_pair(s_id, p)
 
         if self.state_timer < TDM_SWITCH_RATE + dt:
             return
 
-        drone.point_toward_beacon(env)
-
+        # --- Посадочная эвристика по мощности/высоте ---
         if self.last_total_power > LANDING_DECEL_POWER:
             if drone.speed > LANDING_SPEED_MPS:
                 drone.speed = LANDING_SPEED_MPS
-            current_dir_xy = drone.direction[:2]
-            xy_norm = np.linalg.norm(current_dir_xy)
-            if xy_norm > 1e-6:
-                current_dir_xy /= xy_norm
-            z_comp = math.sin(-DESCENT_ANGLE_RAD)
-            xy_comp = math.cos(-DESCENT_ANGLE_RAD)
-            drone.direction[:2] = current_dir_xy * xy_comp
-            drone.direction[2] = z_comp
-            drone.direction /= np.linalg.norm(drone.direction)
 
-        if drone.pos[2] <= LANDING_FINAL_ALTITUDE and self.last_total_power > LANDING_SAFE_POWER:
+        # финальная высота → финальная скорость
+        if drone.pos[2] <= LANDING_FINAL_ALTITUDE and drone.speed > LANDING_FINAL_SPEED_MPS:
             drone.speed = LANDING_FINAL_SPEED_MPS
-            drone.direction = np.array([0.0, 0.0, -1.0])
-            
-        if self.last_total_power > LANDING_SAFE_POWER:
-            drone.speed = 0.0
 
+        # "безопасная зона": не останавливаемся в воздухе
+        if self.last_total_power > LANDING_SAFE_POWER:
+            if drone.pos[2] <= LANDING_FINAL_ALTITUDE:
+                # разрешение на касание: мягкое снижение вертикально
+                drone.speed = LANDING_FINAL_SPEED_MPS
+                drone.direction = np.array([0.0, 0.0, -1.0], dtype=float)
+            else:
+                # выше финальной высоты — переходим на вертикальное снижение
+                drone.speed = max(drone.speed, LANDING_FINAL_SPEED_MPS)
+                drone.direction = np.array([0.0, 0.0, -1.0], dtype=float)
+
+        # если уже стоим — сброс состояний
         if drone.speed == 0.0:
-            self.power_readings = {}
+            self.power_readings.clear()
+            self._pair = None
+            self._last_sector = None
             self.state_timer = 0.0
             return
 
-        visible_sectors = list(self.power_readings.keys())
-        forward_vec = drone.direction.copy()
-        up_vec = np.array([0.0, 0.0, 1.0])
-        right_vec = np.cross(forward_vec, up_vec)
-        right_vec /= np.linalg.norm(right_vec)
+        # --- Управление курсом: «ищу шов» ---
+        if self._pair is not None:
+            s0, p0, s1, p1 = self._pair
+            # Нормируем ошибку по сумме, чтобы быть инвариантными к масштабу мощности
+            denom = max(1e-6, (p0 + p1))
+            e = (p0 - p1) / denom  # [-1..1]
+            dpsi = max(-MAX_YAW_STEP, min(MAX_YAW_STEP, K_YAW * e))
+            drone.change_yaw(dpsi)
+        # иначе — нет валидной пары, курс без изменений
 
-        if len(visible_sectors) < 2:
-            drone.pos += right_vec * STRAFE_DISTANCE_M
-        else:
-            s0, s1 = visible_sectors[0], visible_sectors[1]
-            p0 = self.power_readings[s0]
-            p1 = self.power_readings[s1]
-            if abs(p0 - p1) < POWER_TOLERANCE:
-                pass
-            elif p0 > p1:
-                drone.pos += right_vec * STRAFE_DISTANCE_M
-            else:
-                drone.pos -= right_vec * STRAFE_DISTANCE_M
-
-        self.power_readings = {}
+        # очистка окна измерений на следующий цикл
+        self.power_readings.clear()
+        self._pair = None
         self.state_timer = 0.0
-        
-

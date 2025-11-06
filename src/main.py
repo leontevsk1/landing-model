@@ -55,13 +55,15 @@ def run_landing_test(viz_on: bool = False):
     # Вспомогательные переменные для логирования
     log_timer = 0.0
     total_sim_time = 0.0
-    
+    vis = viz.Visualizer(success_radius_m=SUCCESS_RADIUS_M, fmt="mp4", fps=24)
+
     while True: # Бесконечный цикл, который прервется по условию посадки
         
         dt = cl.SIM_DT
         
         # --- БЛОК СИМУЛЯЦИИ ---
         env.update(dt)
+        vis.capture(beacon, drone, env, total_sim_time)
         drone.integrate(dt)
         total_sim_time += dt
 
@@ -126,4 +128,4 @@ def run_landing_test(viz_on: bool = False):
 
 # --- Запуск теста ---
 if __name__ == "__main__":
-    run_landing_test()
+    run_landing_test(True)
