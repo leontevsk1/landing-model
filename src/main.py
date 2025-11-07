@@ -3,7 +3,7 @@ import math
 import random
 import time
 import classes as cl
-import visual as viz
+
 
 # ----------------------------- ПАРАМЕТРЫ ТЕСТА ------------------------------
 SUCCESS_RADIUS_M = 2.0    # (м) Целевой радиус для успешной посадки
@@ -40,43 +40,36 @@ def initialize_random_scenario() -> tuple[cl.Beacon, cl.Drone, cl.Environment, c
 
 
 
-def run_landing_test(viz_on: bool = False):
+def run_landing_test():
     """Главный цикл симуляции с подробным логированием и валидацией."""
-    vis = viz.Visualizer(success_radius_m=SUCCESS_RADIUS_M) if viz_on else None
-    # 1. Инициализация сценария
+
     beacon, drone, env, controller = initialize_random_scenario()
     
     print("--- НАЧАЛО ТЕСТА ПОСАДКИ (M1) ---")
     print(f"  Начальная позиция (X, Y, Z): [{drone.pos[0]:.2f}, {drone.pos[1]:.2f}, {drone.pos[2]:.2f}]")
     print(f"  Начальная скорость: {drone.speed:.2f} м/с")
-    print(f"  Условие успеха: R < {SUCCESS_RADIUS_M} м")
     print("-" * 50)
     
     # Вспомогательные переменные для логирования
     log_timer = 0.0
     total_sim_time = 0.0
-    vis = viz.Visualizer(success_radius_m=SUCCESS_RADIUS_M, fmt="mp4", fps=24)
-
+    
     while True: # Бесконечный цикл, который прервется по условию посадки
         
         dt = cl.SIM_DT
         
-        # --- БЛОК СИМУЛЯЦИИ ---
         env.update(dt)
-        vis.capture(beacon, drone, env, total_sim_time)
         drone.integrate(dt)
         total_sim_time += dt
 
-        # --- КРИТИЧЕСКАЯ ПРОВЕРКА (Сразу после интеграции) ---
+        #КРИТИЧЕСКАЯ ПРОВЕРКА
         if drone.pos[2] == 0.0 and drone.speed == 0.0:
             print(f"[{total_sim_time:.1f}с] Посадка обнаружена. Переход к валидации.")
             break
         
-        # --- БЛОК КОНТРОЛЛЕРА ---
-
         controller.update(env, drone, dt)
         
-        # --- БЛОК ЛОГИРОВАНИЯ (раз в оборот маяка ~1.0 сек) ---
+        #БЛОК ЛОГИРОВАНИЯ
         log_timer += dt
         if log_timer >= cl.TDM_SWITCH_RATE:
             log_timer = 0.0
@@ -101,8 +94,7 @@ def run_landing_test(viz_on: bool = False):
             # print(f"    Pos XY: [{pos[0]:.2f}, {pos[1]:.2f}] | Dir Z: {drone.direction[2]:.2f}")
             print("-" * 50)
 
-
-    # ========================== ВАЛИДАЦИЯ РЕЗУЛЬТАТА ==========================
+    #ВАЛИДАЦИЯ
     
     landing_pos_xy = drone.pos[:2]
     distance_from_beacon = np.linalg.norm(landing_pos_xy)
@@ -123,9 +115,5 @@ def run_landing_test(viz_on: bool = False):
     
     print("-" * 50)
     
-    if viz_on:
-        vis.plot_all(beacon_xy=(0.0, 0.0))
-
-# --- Запуск теста ---
 if __name__ == "__main__":
-    run_landing_test(True)
+    run_landing_test()
